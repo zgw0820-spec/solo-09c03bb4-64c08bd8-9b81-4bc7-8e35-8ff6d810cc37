@@ -6,8 +6,10 @@ services:
       DNS_ROLE: primary
       DNS_ZONE: internal.local
       DB_PATH: /data/primary.db
+      EVIDENCE_DB_PATH: /data/primary-evidence.db
       DNS_PORT: "5053"
       API_PORT: "8000"
+      EVIDENCE_BUFFER_SIZE: "10000"
     ports:
       - "8080:8000"      # primary Swagger / REST
       - "5053:5053/udp"  # primary DNS
@@ -29,8 +31,10 @@ services:
       DNS_ROLE: backup
       DNS_ZONE: internal.local
       DB_PATH: /data/backup.db
+      EVIDENCE_DB_PATH: /data/backup-evidence.db
       DNS_PORT: "5053"
       API_PORT: "8000"
+      EVIDENCE_BUFFER_SIZE: "10000"
       PRIMARY_API_URL: http://primary:8000
       SYNC_INTERVAL: "3"
       HTTP_TIMEOUT: "10"

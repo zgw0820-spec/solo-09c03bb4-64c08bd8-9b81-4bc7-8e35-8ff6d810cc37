@@ -99,3 +99,52 @@ class PublishResult(BaseModel):
     serial: int
     record_count: int
     published_at: str
+
+
+class EvidenceRecord(BaseModel):
+    queried_at: str
+    client_ip: str
+    qname: str
+    qtype: str
+    rcode: str
+    addresses: List[str]
+    serial: int
+    role: str
+
+
+class EvidenceGap(BaseModel):
+    kind: str
+    start_at: str
+    end_at: str
+    details: dict
+    recorded_at: Optional[str] = None
+
+
+class EvidenceQueryOut(BaseModel):
+    role: str
+    zone: str
+    client_ip: str
+    window_start: str
+    window_end: str
+    qname: Optional[str] = None
+    records: List[EvidenceRecord]
+    evidence_complete: bool
+    gaps: List[EvidenceGap]
+    truncated: bool = False
+    buffered_not_yet_written: int = 0
+    note: str
+
+
+class EvidenceSourceOut(BaseModel):
+    """Per-server provenance so primary and backup evidence is comparable."""
+
+    role: str
+    zone: str
+    db_path: str
+    coverage_start: Optional[str] = None
+    buffer_capacity: int
+    buffered: int
+    inflight: int
+    dropped_total: int
+    write_errors: int
+    db_ready: bool

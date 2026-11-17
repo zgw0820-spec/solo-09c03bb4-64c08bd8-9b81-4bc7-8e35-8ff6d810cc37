@@ -8,6 +8,9 @@
   版本查询；两机各自使用独立 SQLite 数据库（不同文件/卷）。
 - 两机都通过 **UDP 53 风格端口（默认 5053）** 回答区域内 A 查询，每个回答只取自
   **一份不可变的完整版本**快照，绝不混版。
+- 两机各自提供**区域内 A 查询取证 API**：按客户端 IP + 时间段回放该机当时实际
+  发出的应答（查询名、应答码、地址、应答所用区域序号）；证据行与当次 UDP 应答
+  取自同一份版本快照，证据缺失的时间段会明确标注“证据不完整”。
 
 ## 设计要点与需求对应
 
@@ -15,29 +18,69 @@
 | --- | --- |
 | 单次提交 ≤8 条 A 记录的完整区域 | `app/models.py`：非空、≤8、仅 IPv4、名称必须在固定区域内、禁止重名 |
 | 发布成功才递增序号 | `Storage.next_publish()`：单事务 `BEGIN IMMEDIATE` 内插入新版本并切换 active 指针；校验失败在进事务前返回 422，序号不变 |
-| 两机独立数据库 | 各自 `DB_PATH`（compose 中 `primary-data` / `backup-data` 两个卷） |
-| 单次回答只用一份完整版本 | `zone_versions` 存不可变整份快照；DNS 解析前一次性读取 active 版本，再在内存中查表回答 |
+| 两机独立数据库 | 各自 `DB_PATH`（compose 中 `primary-data` / `backup-data` 两个卷）；每机的取证库是与区域库分离的另一个独立文件 |
+| 单次回答只用一份完整版本 | `zone_versions` 存不可变整份快照；DNS 解析前在**一个读事务**里同时读取 active 指针与版本行，再在内存中查表回答 |
 | 手动同步 + 版本查询 | `POST /api/sync`、`GET /api/version`、`GET /api/zone` |
 | 慢传/断传期间继续回答旧版 | 传输失败（连接拒绝、超时、HTTP 错误、坏报文）不触碰 active 版本，旧版本继续服务；同步状态写入 `state` 表 |
 | 断开/重启后自动追到最新版 | 备用机启动即拉取一次，之后按 `SYNC_INTERVAL` 后台循环，直到与上游同序号 |
 | 迟到旧传输不得回退 | `commit_version()` 拒绝任何 `serial <= active_serial` 的版本（返回 `ignored_stale`/False），事务保护 |
 | 任一方失败仍供原版 | 发布失败保留旧 active；同步失败保留旧 active；DNS 与 HTTP 在同一进程内独立运行 |
 | 主机发布无需等待备用 | 主机 API 不调用备用机；e2e 中备用停机时发布仍在毫秒级成功 |
+| 取证：当时实际答了什么 | `app/evidence.py`：UDP 应答路径用同一个 `(serial, records)` 快照填写证据行；`GET /api/evidence/queries` 按客户端 IP + 时间段回放 |
+| 证据与应答同一快照 | 解析器只读一次版本，然后用同一份数据构造应答并记录 `serial`/地址；地址取自已构造的应答报文 |
+| 突发流量 / SQLite 暂不可写仍可服务 | UDP 解析、发布、同步走各自的库与事务；取证写入为**有界内存队列 + 独立写线程**，队列满即丢弃并记 `buffer_overflow` 标记，绝不阻塞解析 |
+| 漏记/重启遗失须标明不完整 | 证据库记录 `last_alive_at` 心跳：重启后自动写 `startup_gap`；写入失败写 `write_failure`；取证库不可读时返回 `evidence_db_unavailable`；覆盖起点之前的时间段标 `before_coverage` |
+| 空结果 ≠ 客户端未查询 | 仅当 `evidence_complete=true` 时接口才说明“该时间段没有匹配查询”；否则返回 `gaps` 与 `evidence_complete=false` |
+| 备用断流时记录本机旧版应答 | 同步失败不动 active 版本，备用机继续用旧版回答并把该旧版 `serial` 记入证据；恢复后保留原证据（证据库独立于区域库，不会被覆盖） |
 | Docker Compose 双服务 + Swagger | `docker-compose.yml` 起 primary/backup；`http://<host>:8080/docs`、`http://<host>:8081/docs` |
 
 ### 数据模型（SQLite，WAL 模式）
+
+区域库（`DB_PATH`，每机独立）：
 
 ```
 zone_versions(serial INTEGER PRIMARY KEY, records_json TEXT,
               record_count INTEGER, published_at TEXT)   -- 不可变整份版本
 state(key TEXT PRIMARY KEY, value TEXT)
-        active_serial      当前生效版本指针
-        last_sync_*        备用机最近一次同步状态（at/status/error）
-        upstream_serial    最近看到的上游序号
+        active_serial          当前生效版本指针
+        last_sync_*            备用机最近一次同步状态（at/status/error）
+        upstream_serial        最近看到的上游序号
+        evidence_pending_loss  取证库写不进去时的跨库“遗失”标记（重启后转成证据 gap）
 ```
 
 版本切换 = 插入新版本行 + 更新 `active_serial` 指针，在同一个事务里提交，
 因此外部观察到的永远是“某一份完整版本”，不存在中间态。
+
+取证库（`EVIDENCE_DB_PATH`，默认 `<DB_PATH>.evidence.db`，每机独立）：
+
+```
+evidence_queries(id, at, client_ip, qname, qtype, rcode, addresses,
+                 serial, role)                       -- 每次实际发出的 UDP A 应答
+evidence_markers(id, kind, start_at, end_at, details, recorded_at)
+        kind = startup_gap | buffer_overflow | write_failure |
+               evidence_db_unavailable
+evidence_meta(key, value)
+        first_alive_at / last_alive_at                -- 重启 gap 边界与覆盖起点
+```
+
+### 取证语义
+
+`GET /api/evidence/queries?client_ip=&start=&end=[&qname=&limit=]`
+
+- `records[]`：该机在 `[start, end]` 内实际发出的**区域内 A 应答**，每条含
+  `queried_at`、`rcode`、`addresses`、`serial`（应答所用版本序号）、`role`。
+  区域内不存在的名称记为 `NXDOMAIN` 且 `addresses=[]`。
+- `evidence_complete`：窗口内不存在任何已知证据缺失时为 `true`。为 `false` 时
+  **不能**把空 `records` 解读成“客户端没有查询”。
+- `gaps[]`：证据缺失区间及原因（`startup_gap` 停服/重启、`buffer_overflow`
+  队列溢出、`write_failure` 取证库写入失败、`evidence_db_unavailable` 取证库不可用、
+  `before_coverage` 早于取证覆盖起点、`pending_uncommitted` 仍有未落盘记录）。
+- `buffered_not_yet_written`：读取时仍在队列/写入中的条数；接口会先等待最多 1s
+  让刚产生的应答落盘，仍未完成则整体标记不完整。
+- `qname` 过滤为精确名（忽略大小写与末尾点）；`limit` 默认 1000，超出时
+  `truncated=true` 且整体标记不完整。
+- `GET /api/evidence/status`：本机取证库角色、路径、覆盖起点、缓冲容量、
+  当前积压、累计丢弃数与写失败次数，便于分别核对主/备两机。
 
 ## 端口与 API
 
@@ -46,9 +89,11 @@ state(key TEXT PRIMARY KEY, value TEXT)
 | primary | 主机 8080 → 容器 8000 | 主机 5053 → 容器 5053/udp |
 | backup  | 主机 8081 → 容器 8000 | 主机 5054 → 容器 5053/udp |
 
-- `GET  /health` 健康检查
+- `GET  /health` 健康检查（含取证缓冲/丢弃/写失败计数）
 - `GET  /api/version` 角色、当前序号、记录数、备用机同步状态
 - `GET  /api/zone` 当前完整区域（含 serial、records、published_at）
+- `GET  /api/evidence/queries` **主备都有**，按客户端 IP + 时间段回放本机实际应答
+- `GET  /api/evidence/status` **主备都有**，本机取证覆盖与缓冲状态
 - `POST /api/zone` **仅主机**，请求体 `{"records":[{"name":"db.internal.local","ip":"10.0.0.11"}]}`，成功返回 201 与新 serial
 - `POST /api/sync` **仅备用机**，立即拉取一次，返回 `synced` / `ignored_stale` / `failed`
 
@@ -74,6 +119,11 @@ curl -sX POST http://localhost:8081/api/sync
 # UDP 查询
 dig @127.0.0.1 -p 5053 db.internal.local A
 dig @127.0.0.1 -p 5054 db.internal.local A   # 备用机
+
+# 取证：该客户端在这个时间段，主机/备用各自实际答了什么
+curl -s 'http://localhost:8080/api/evidence/queries?client_ip=127.0.0.1&start=2026-11-17T08:00:00Z&end=2026-11-17T09:00:00Z'
+curl -s 'http://localhost:8081/api/evidence/queries?client_ip=127.0.0.1&start=2026-11-17T08:00:00Z&end=2026-11-17T09:00:00Z'
+curl -s http://localhost:8080/api/evidence/status    # 本机取证覆盖/缓冲状态
 ```
 
 ### 本地直接运行（无 Docker 时）
@@ -91,14 +141,22 @@ DNS_ROLE=backup  DB_PATH=./data/backup.db  DNS_PORT=15054 API_PORT=18001 \
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest tests/test_unit.py -q     # 校验/事务/防回退单元测试
-.venv/bin/python -I tests/e2e_test.py                # 双进程端到端 30 项
-.venv/bin/python -I tests/auto_sync_test.py          # 自动同步/幂等/Swagger 8 项
+.venv/bin/python -m pytest tests/test_unit.py -q            # 校验/事务/防回退单元测试
+.venv/bin/python -m pytest tests/test_evidence_unit.py -q   # 取证缓冲/gap/查询语义单元测试
+.venv/bin/python -I tests/e2e_test.py                       # 双进程端到端 30 项
+.venv/bin/python -I tests/auto_sync_test.py                 # 自动同步/幂等/Swagger 8 项
+.venv/bin/python -I tests/evidence_test.py                  # 取证 API 双进程 34 项（含突发溢出/写失败/重启/断流/主备独立）
 ```
 
 端到端覆盖：启动空版本 NXDOMAIN、非法发布不升序号、发布后 UDP 应答、
 手动与自动同步、黑洞上游期间旧版持续服务、恢复后自动追平、
 迟到旧版本注入被拒且不回退、进程重启持久化与追赶、备用停机时主机照常发布。
+
+取证测试覆盖：证据与 UDP 应答逐字段一致（含 NXDOMAIN）、换版时每条应答带对
+应 serial、空结果与覆盖边界、重启后保留旧证据并标出停机 gap、400 次突发查询
+下 UDP/发布不中断且标记溢出、取证库不可写时解析与发布不受影响并返回
+`evidence_db_unavailable`、取证库恢复后补记中断窗口、主备各自独立的取证行、
+备用断流时记录旧版应答、恢复后新旧证据都保留。
 
 ## 配置（环境变量）
 
@@ -106,7 +164,13 @@ DNS_ROLE=backup  DB_PATH=./data/backup.db  DNS_PORT=15054 API_PORT=18001 \
 | --- | --- | --- |
 | `DNS_ROLE` | `primary` | `primary` 或 `backup` |
 | `DNS_ZONE` | `internal.local` | 固定内网区域名 |
-| `DB_PATH` | `/data/dns.db` | 本机独立 SQLite 文件 |
+| `DB_PATH` | `/data/dns.db` | 本机独立 SQLite 文件（区域版本） |
+| `EVIDENCE_DB_PATH` | `<DB_PATH>.evidence.db` | 本机独立取证 SQLite 文件（与区域库分离） |
+| `EVIDENCE_BUFFER_SIZE` | `10000` | 取证写入队列上限（有界；满则丢弃并标记溢出） |
+| `EVIDENCE_BATCH_SIZE` | `256` | 单次取证批量写入条数 |
+| `EVIDENCE_FLUSH_INTERVAL_MS` | `200` | 取证写线程轮询间隔毫秒 |
+| `EVIDENCE_RETRY_MS` | `500` | 取证库不可写时的重试间隔毫秒 |
+| `EVIDENCE_DB_TIMEOUT_MS` | `2000` | 取证库连接/锁等待上限毫秒 |
 | `DNS_PORT` / `API_PORT` | `5053` / `8000` | UDP DNS / HTTP 端口 |
 | `PRIMARY_API_URL` | `http://primary:8000` | 备用机指向上机 API |
 | `SYNC_INTERVAL` | `5` | 备用机后台同步间隔秒 |
@@ -116,6 +180,11 @@ DNS_ROLE=backup  DB_PATH=./data/backup.db  DNS_PORT=15054 API_PORT=18001 \
 ## 已知边界
 
 - 仅支持 A 记录与 IPv4（题目范围）；区域固定为一个，区域名通过配置设定。
+- 取证只覆盖**区域内 A 查询**（有明确区域序号可归因）；区域外 REFUSED、AAAA
+  等非 A 查询不记取证（其应答不含区域内地址）。客户端 IP 取 UDP 源地址，
+  经 NAT 后记录的是 NAT 后的地址。
+- 证据库与区域库分离，若证据文件整体丢失（例如卷损坏）则历史证据不可恢复；
+  但重启/写失败/溢出等已知缺失均会以 gap 标注，不会伪装成“无查询”。
 - 传输为整份区域拉取（无增量/AXFR 分帧）；区域上限 8 条，单份报文很小。
 - 单机内嵌一个 UDP 解析线程与一个 uvicorn 进程；未做水平扩展与 TSIG 鉴权，
   内网部署时应限制 `/api/zone` 的调用来源。
